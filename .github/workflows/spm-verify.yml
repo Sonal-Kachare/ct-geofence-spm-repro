@@ -1,0 +1,216 @@
+name: SPM consumption verify
+
+# Diagnostic pipeline for the reported issue: SPM resolution of
+# clevertap-geofence-ios fails or times out in CI while working fine in Xcode
+# locally.
+#
+# This establishes a trustworthy baseline on a clean, throwaway runner:
+#   1. how many bytes a consumer actually downloads for this package
+#   2. how long a genuinely cold resolve takes
+#   3. whether a sample app builds and links end to end via SPM
+#
+# It is a CONTROL, not a reproduction. A GitHub-hosted runner has fast,
+# unthrottled network and will very likely pass in a couple of minutes. The
+# value is the comparison: if a clean runner resolves this graph in seconds and
+# a given CI runner takes an hour on the same graph, the bottleneck is that
+# runner's environment rather than the package.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label"
+        default: "macos-latest"
+  push:
+    branches: [ main ]
+
+concurrency:
+  group: spm-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Payload size. Pure git, no Xcode.
+  #
+  #    SwiftPM checks out package dependencies with submodules, recursively.
+  #    clevertap-geofence-ios carries a Vendors/CleverTap submodule pointing at
+  #    the full clevertap-ios-sdk repo, which in turn carries a nested
+  #    Vendors/SDWebImage submodule. Package.swift never references Vendors/,
+  #    so every consumer downloads this history for nothing.
+  # ---------------------------------------------------------------------------
+  clone-cost:
+    name: Clone payload (plain vs recursive)
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
+    timeout-minutes: 30
+    steps:
+      - name: Plain clone (no submodules)
+        run: |
+          start=$(date +%s)
+          git clone --quiet https://github.com/CleverTap/clevertap-geofence-ios.git plain
+          echo "PLAIN_SECS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+          echo "PLAIN_SIZE=$(du -sm plain | cut -f1)" >> "$GITHUB_ENV"
+
+      - name: Recursive clone (what SwiftPM actually does)
+        run: |
+          start=$(date +%s)
+          git clone --quiet --recurse-submodules \
+            https://github.com/CleverTap/clevertap-geofence-ios.git recursive
+          echo "REC_SECS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+          echo "REC_SIZE=$(du -sm recursive | cut -f1)" >> "$GITHUB_ENV"
+
+      - name: Where the bytes go
+        run: |
+          echo "--- submodule working trees ---"
+          du -sm recursive/Vendors/CleverTap || true
+          du -sm recursive/Vendors/CleverTap/Vendors/SDWebImage || true
+          echo "--- git object stores ---"
+          du -sm recursive/.git || true
+          du -sm recursive/.git/modules || true
+          echo "--- what SPM actually compiles ---"
+          du -sk recursive/Sources
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Clone payload"
+            echo ""
+            echo "| Clone mode | Time | On disk |"
+            echo "|---|---|---|"
+            echo "| plain (no submodules) | ${PLAIN_SECS:-?}s | ${PLAIN_SIZE:-?} MB |"
+            echo "| recursive (SwiftPM behaviour) | ${REC_SECS:-?}s | ${REC_SIZE:-?} MB |"
+            echo ""
+            echo "\`Sources/\` is the only directory SPM compiles."
+            echo "The difference between these two rows is removable overhead."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 2. Cold resolve through xcodebuild, as a fresh CI runner experiences it.
+  #    The matrix covers both the committed-lockfile case and the no-lockfile
+  #    case, since a missing or stale pin changes resolution behaviour.
+  # ---------------------------------------------------------------------------
+  cold-resolve:
+    name: Cold resolve (lockfile ${{ matrix.lockfile }})
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        lockfile: [keep, drop]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain in use
+        run: |
+          xcodebuild -version
+          swift --version
+          echo "--- Xcodes available on this runner ---"
+          ls /Applications | grep -i '^Xcode' || true
+
+      - name: Drop Package.resolved
+        if: matrix.lockfile == 'drop'
+        run: |
+          rm -f SPMSample/SPMSample.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+          echo "Removed committed Package.resolved to force full re-resolution."
+
+      - name: Cold resolve, isolated caches
+        env:
+          SPM_DIR: ${{ runner.temp }}/spm-cold
+        run: |
+          set -o pipefail
+          rm -rf "$SPM_DIR" ~/Library/Caches/org.swift.swiftpm
+          mkdir -p "$SPM_DIR"
+          start=$(date +%s)
+          xcodebuild -resolvePackageDependencies \
+            -project SPMSample/SPMSample.xcodeproj \
+            -scheme SPMSample \
+            -clonedSourcePackagesDirPath "$SPM_DIR" \
+            2>&1 | tee resolve.log
+          echo "RESOLVE_SECS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+          echo "SPM_SIZE=$(du -sm "$SPM_DIR" | cut -f1)" >> "$GITHUB_ENV"
+
+      - name: Resolved graph and footprint
+        if: always()
+        env:
+          SPM_DIR: ${{ runner.temp }}/spm-cold
+        run: |
+          echo "--- resolved versions ---"
+          cat SPMSample/SPMSample.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved 2>/dev/null \
+            || echo "(no Package.resolved present)"
+          echo "--- per-checkout size ---"
+          du -sm "$SPM_DIR"/checkouts/* 2>/dev/null || true
+          echo "--- did the geofence submodule get pulled in? ---"
+          if [ -d "$SPM_DIR/checkouts/clevertap-geofence-ios/Vendors/CleverTap" ] \
+             && [ -n "$(ls -A "$SPM_DIR/checkouts/clevertap-geofence-ios/Vendors/CleverTap" 2>/dev/null)" ]; then
+            echo "YES - submodule populated:"
+            du -sm "$SPM_DIR/checkouts/clevertap-geofence-ios/Vendors/CleverTap"
+          else
+            echo "NO - submodule not populated"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Cold resolve (lockfile: ${{ matrix.lockfile }})"
+            echo ""
+            echo "- wall time: \`${RESOLVE_SECS:-did not complete}s\`"
+            echo "- SourcePackages on disk: \`${SPM_SIZE:-?} MB\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: resolve-log-${{ matrix.lockfile }}
+          path: resolve.log
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # 3. Does the sample app actually build AND link against the package?
+  #    AppDelegate.swift imports CleverTapGeofence and calls into it, so this
+  #    fails if the product does not link, not just if resolution breaks.
+  #    Signing is disabled, so no certificates or profiles are needed.
+  # ---------------------------------------------------------------------------
+  build-sample:
+    name: Build and link SPMSample
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain in use
+        run: xcodebuild -version
+
+      - name: Build for simulator
+        run: |
+          set -o pipefail
+          start=$(date +%s)
+          xcodebuild build \
+            -project SPMSample/SPMSample.xcodeproj \
+            -scheme SPMSample \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -clonedSourcePackagesDirPath '${{ runner.temp }}/spm-build' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            2>&1 | tee build.log
+          echo "BUILD_SECS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Sample app build"
+            echo ""
+            echo "- wall time: \`${BUILD_SECS:-did not complete}s\`"
+            echo "- imports and calls \`CleverTapGeofence\`, so this covers linking"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn

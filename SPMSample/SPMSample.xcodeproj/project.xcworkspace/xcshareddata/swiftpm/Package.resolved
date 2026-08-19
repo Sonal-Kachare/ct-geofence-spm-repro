@@ -1,0 +1,24 @@
+{
+  "originHash" : "c669bf39c7adec338dc58b914f21ec59582cb0375bf5d18193e893ba03ada7cf",
+  "pins" : [
+    {
+      "identity" : "clevertap-geofence-ios",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/CleverTap/clevertap-geofence-ios.git",
+      "state" : {
+        "revision" : "f142c16a3b2130c0f2057f717be64b57992e396b",
+        "version" : "1.0.7"
+      }
+    },
+    {
+      "identity" : "clevertap-ios-sdk",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/CleverTap/clevertap-ios-sdk.git",
+      "state" : {
+        "revision" : "634f57cc0e8a9531757f89a6507e8dd83130e111",
+        "version" : "7.8.1"
+      }
+    }
+  ],
+  "version" : 3
+}
