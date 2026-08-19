@@ -1,0 +1,167 @@
+name: UAT build
+
+# Produces a Release build of SPMSample, the same shape of work a
+# "user-build-uat" style job does: resolve SPM dependencies, archive for device,
+# and publish the result as a downloadable artifact.
+#
+# SIGNING: this workflow builds UNSIGNED. It needs no certificates, no
+# provisioning profiles, and no repository secrets, which means it runs anywhere
+# and is safe in a public repo. The tradeoff is that the .ipa it produces is a
+# valid bundle but is NOT installable on a device until it is signed.
+#
+# To make it installable, see "Making this installable" in README.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label"
+        default: "macos-latest"
+      marketing_version:
+        description: "Version string (CFBundleShortVersionString)"
+        default: "1.0"
+  push:
+    tags:
+      - "uat-*"
+
+concurrency:
+  group: uat-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  uat:
+    name: Release archive
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
+    timeout-minutes: 60
+
+    env:
+      MARKETING_VERSION: ${{ inputs.marketing_version || '1.0' }}
+      # Monotonic build number, so successive UAT builds are distinguishable.
+      BUILD_NUMBER: ${{ github.run_number }}
+      ARCHIVE_PATH: ${{ github.workspace }}/build/SPMSample.xcarchive
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain in use
+        run: xcodebuild -version
+
+      - name: Resolve dependencies
+        run: |
+          set -o pipefail
+          start=$(date +%s)
+          xcodebuild -resolvePackageDependencies \
+            -project SPMSample/SPMSample.xcodeproj \
+            -scheme SPMSample \
+            -clonedSourcePackagesDirPath "${{ runner.temp }}/spm" \
+            2>&1 | tee resolve.log
+          echo "RESOLVE_SECS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+
+      - name: Archive for device (unsigned)
+        run: |
+          set -o pipefail
+          start=$(date +%s)
+          xcodebuild archive \
+            -project SPMSample/SPMSample.xcodeproj \
+            -scheme SPMSample \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            -clonedSourcePackagesDirPath "${{ runner.temp }}/spm" \
+            MARKETING_VERSION="$MARKETING_VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            2>&1 | tee archive.log
+          echo "ARCHIVE_SECS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+
+      - name: Verify the archive and confirm the SDK linked
+        run: |
+          APP="$ARCHIVE_PATH/Products/Applications/SPMSample.app"
+          test -d "$APP" || { echo "::error::no .app inside the archive"; exit 1; }
+
+          echo "--- version actually baked into the bundle ---"
+          SHORT=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")
+          BUILD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist")
+          echo "CFBundleShortVersionString = $SHORT"
+          echo "CFBundleVersion            = $BUILD"
+          [ "$BUILD" = "$BUILD_NUMBER" ] || { echo "::error::build number not injected"; exit 1; }
+          echo "BUNDLE_SHORT=$SHORT" >> "$GITHUB_ENV"
+          echo "BUNDLE_BUILD=$BUILD" >> "$GITHUB_ENV"
+
+          # The geofence SDK ships a resource bundle. Its presence in the built
+          # product is direct evidence the SPM product was compiled and bundled,
+          # rather than merely resolved.
+          echo "--- CleverTapGeofence resource bundle present? ---"
+          if [ -d "$APP/CleverTapGeofence_CleverTapGeofence.bundle" ]; then
+            echo "yes"
+          else
+            echo "::error::CleverTapGeofence resource bundle missing from the app"
+            exit 1
+          fi
+
+          echo "--- embedded frameworks ---"
+          ls "$APP/Frameworks" || true
+
+          echo "--- architectures ---"
+          lipo -info "$APP/SPMSample" || file "$APP/SPMSample"
+
+      - name: Package unsigned .ipa
+        run: |
+          cd "$(dirname "$ARCHIVE_PATH")"
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$ARCHIVE_PATH/Products/Applications/SPMSample.app" Payload/
+          IPA="SPMSample-${BUNDLE_SHORT}-${BUNDLE_BUILD}-unsigned.ipa"
+          zip -qry "$IPA" Payload
+          echo "IPA_NAME=$IPA" >> "$GITHUB_ENV"
+          echo "IPA_SIZE=$(du -m "$IPA" | cut -f1) MB" >> "$GITHUB_ENV"
+          # Fail loudly rather than publishing an empty artifact.
+          unzip -l "$IPA" | grep -q 'Payload/SPMSample.app/SPMSample' \
+            || { echo "::error::ipa does not contain the app binary"; exit 1; }
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## UAT build"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| version | \`${BUNDLE_SHORT:-?} (${BUNDLE_BUILD:-?})\` |"
+            echo "| artifact | \`${IPA_NAME:-not produced}\` |"
+            echo "| ipa size | \`${IPA_SIZE:-?}\` |"
+            echo "| resolve | \`${RESOLVE_SECS:-?}s\` |"
+            echo "| archive | \`${ARCHIVE_SECS:-?}s\` |"
+            echo ""
+            echo "Build is **unsigned** and is not installable on a device as-is."
+            echo "See \`Making this installable\` in the README."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload .ipa
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SPMSample-unsigned-ipa
+          path: build/*.ipa
+          if-no-files-found: error
+
+      - name: Upload .xcarchive
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SPMSample-xcarchive
+          path: build/SPMSample.xcarchive
+          if-no-files-found: error
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uat-logs
+          path: |
+            resolve.log
+            archive.log
+          if-no-files-found: warn

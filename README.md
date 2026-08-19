@@ -29,6 +29,7 @@ SPMSample/                     Xcode app consuming CleverTapGeofence via SPM
     xcshareddata/xcschemes/    shared scheme, required for CI
 .github/workflows/
   spm-verify.yml               the diagnostic pipeline
+  uat-build.yml                Release archive, publishes an unsigned .ipa
 ```
 
 `SPMSample/SPMSample/AppDelegate.swift` deliberately imports
@@ -48,6 +49,52 @@ Three independent jobs, triggered on push to `main` or via
 
 Each job writes its numbers to the run summary, and the resolve and build logs
 are uploaded as artifacts.
+
+## The UAT build workflow
+
+`.github/workflows/uat-build.yml` produces a Release build of the same sample
+app, which is the shape of work a `user-build-uat` style job does: resolve SPM
+dependencies, archive for device, publish the result.
+
+Run it from the Actions tab (`workflow_dispatch`), or by pushing a tag matching
+`uat-*`.
+
+It publishes three artifacts: an unsigned `.ipa`, the full `.xcarchive`, and the
+resolve and archive logs. The build number comes from the workflow run number, so
+successive UAT builds are distinguishable, and the workflow asserts that the
+number actually reached `CFBundleVersion` rather than trusting that it did.
+
+It also asserts that `CleverTapGeofence_CleverTapGeofence.bundle` is present in
+the built product. That bundle is the geofence SDK's own SPM resource bundle, so
+its presence is direct evidence the package was compiled and bundled into the
+app rather than merely resolved. The job fails if it is missing.
+
+### Making this installable
+
+The workflow builds **unsigned**, so it needs no certificates, no provisioning
+profiles, and no repository secrets. It runs anywhere and is safe in a public
+repo. The tradeoff is that the `.ipa` is a structurally valid bundle that
+**cannot be installed on a device** until it is signed.
+
+To turn this into a genuinely installable UAT build you need, as repository
+secrets:
+
+| Secret | What it is |
+|---|---|
+| `BUILD_CERTIFICATE_BASE64` | base64 of a distribution certificate `.p12` |
+| `P12_PASSWORD` | its password |
+| `PROVISIONING_PROFILE_BASE64` | base64 of a matching `.mobileprovision` |
+| `KEYCHAIN_PASSWORD` | any throwaway value, for the temporary CI keychain |
+
+The build would then import those into a temporary keychain, drop
+`CODE_SIGNING_ALLOWED=NO`, set a real `DEVELOPMENT_TEAM`, and export through
+`xcodebuild -exportArchive` with an export options plist instead of packaging
+`Payload/` by hand.
+
+Two things to weigh before doing that. The bundle identifier here is
+`com.clevertap.SPMSample`, which must match the provisioning profile. And this
+repository is public, so consider whether signing assets belong in it at all
+rather than in a private fork.
 
 ## Measured findings
 
