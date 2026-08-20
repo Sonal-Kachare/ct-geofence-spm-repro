@@ -1,0 +1,163 @@
+name: Xcode version matrix
+
+# Tests whether the reported slow/failing SPM resolve is specific to an older
+# Xcode. The client reports Xcode 16.4 and 26.2; the spm-verify workflow only
+# covers whatever ships on macos-latest (Xcode 26.x), so 16.x was untested.
+#
+# Each image discovers its own installed Xcodes and selects a target version by
+# prefix rather than an exact path, so the run adapts instead of failing when
+# GitHub rotates images. If no matching Xcode exists on an image, that leg
+# reports a notice and skips rather than going red.
+
+on:
+  workflow_dispatch:
+    inputs:
+      xcode_prefix:
+        description: "Xcode version prefix to prefer (e.g. 16.4, 16, 26.2)"
+        default: "16"
+  push:
+    tags:
+      - "xcmatrix-*"
+
+concurrency:
+  group: xcode-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    name: ${{ matrix.image }} / Xcode ${{ inputs.xcode_prefix || '16' }}
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [macos-15, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Inventory installed Xcodes
+        id: inv
+        env:
+          WANT: ${{ inputs.xcode_prefix || '16' }}
+        run: |
+          echo "--- image: ${{ matrix.image }} ---"
+          sw_vers
+          echo "--- installed Xcodes ---"
+          ls -1 /Applications | grep -E '^Xcode' || echo "(none matched)"
+          echo "--- default toolchain ---"
+          xcodebuild -version
+
+          # Prefer an exact prefix match, newest first. Fall back to nothing.
+          PICK=""
+          for app in $(ls -1d /Applications/Xcode_${WANT}*.app 2>/dev/null | sort -Vr); do
+            PICK="$app"; break
+          done
+          if [ -z "$PICK" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Xcode $WANT not present::${{ matrix.image }} has no Xcode matching '$WANT'. Skipping the measured steps on this image."
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "path=$PICK" >> "$GITHUB_OUTPUT"
+            echo "Selected: $PICK"
+          fi
+
+      - name: Select Xcode
+        if: steps.inv.outputs.found == 'true'
+        run: |
+          sudo xcode-select -s "${{ steps.inv.outputs.path }}"
+          xcodebuild -version
+          swift --version
+          echo "XC_VER=$(xcodebuild -version | head -1 | awk '{print $2}')" >> "$GITHUB_ENV"
+
+      - name: Cold resolve, isolated caches
+        id: resolve
+        if: steps.inv.outputs.found == 'true'
+        continue-on-error: true
+        env:
+          SPM_DIR: ${{ runner.temp }}/spm-cold
+        run: |
+          set -o pipefail
+          rm -rf "$SPM_DIR" ~/Library/Caches/org.swift.swiftpm
+          mkdir -p "$SPM_DIR"
+          start=$(date +%s)
+          xcodebuild -resolvePackageDependencies \
+            -project SPMSample/SPMSample.xcodeproj \
+            -scheme SPMSample \
+            -clonedSourcePackagesDirPath "$SPM_DIR" \
+            2>&1 | tee "resolve-${{ matrix.image }}.log"
+          echo "RESOLVE_SECS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+
+      - name: Footprint and submodule behaviour
+        if: steps.inv.outputs.found == 'true'
+        env:
+          SPM_DIR: ${{ runner.temp }}/spm-cold
+        run: |
+          echo "--- per-checkout size (MB) ---"
+          du -sm "$SPM_DIR"/checkouts/* 2>/dev/null || echo "(no checkouts)"
+          echo "--- total SourcePackages ---"
+          du -sm "$SPM_DIR" 2>/dev/null || true
+          echo "--- which packages were fetched at all? ---"
+          ls -1 "$SPM_DIR/checkouts" 2>/dev/null || echo "(none)"
+          echo "--- submodule recursion ---"
+          SUB="$SPM_DIR/checkouts/clevertap-geofence-ios/Vendors/CleverTap"
+          if [ -d "$SUB" ] && [ -n "$(ls -A "$SUB" 2>/dev/null)" ]; then
+            echo "populated: yes"
+            du -sm "$SUB"
+          else
+            echo "populated: no"
+          fi
+          echo "--- resolved versions ---"
+          cat SPMSample/SPMSample.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved 2>/dev/null | head -40 || true
+
+      - name: Build for simulator
+        id: build
+        if: steps.inv.outputs.found == 'true'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          start=$(date +%s)
+          xcodebuild build \
+            -project SPMSample/SPMSample.xcodeproj \
+            -scheme SPMSample \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -clonedSourcePackagesDirPath '${{ runner.temp }}/spm-cold' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
+            2>&1 | tee "build-${{ matrix.image }}.log"
+          echo "BUILD_SECS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+
+      - name: Surface any toolchain complaints
+        if: steps.inv.outputs.found == 'true'
+        run: |
+          echo "--- tools-version / deployment-target / availability diagnostics ---"
+          grep -hiE 'swift-tools-version|deployment target|is unavailable|requires|error:' \
+            "resolve-${{ matrix.image }}.log" "build-${{ matrix.image }}.log" 2>/dev/null \
+            | sort -u | head -25 || echo "(none)"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.image }}"
+            echo ""
+            if [ "${{ steps.inv.outputs.found }}" != "true" ]; then
+              echo "No Xcode matching \`${{ inputs.xcode_prefix || '16' }}\` on this image - skipped."
+            else
+              echo "| | |"
+              echo "|---|---|"
+              echo "| Xcode | \`${XC_VER:-?}\` |"
+              echo "| resolve | \`${RESOLVE_SECS:-failed}s\` (${{ steps.resolve.outcome }}) |"
+              echo "| build | \`${BUILD_SECS:-failed}s\` (${{ steps.build.outcome }}) |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xcode-matrix-logs-${{ matrix.image }}
+          path: |
+            resolve-*.log
+            build-*.log
+          if-no-files-found: warn
